@@ -9,34 +9,160 @@ from flask import Flask, request, jsonify
 
 
 # =========================
-# Configuration
+# Config
 # =========================
-
-# 你自己的 OpenAI 风格 API Key（外部客户端调用你代理时用）
-# 建议用环境变量：export OPENAI_PROXY_API_KEY="sk-xxx"
-OPENAI_PROXY_API_KEY = 'default-key'
 
 AKASH_SESSION_URL = "https://chat.akash.network/api/auth/session/"
 AKASH_CHAT_URL = "https://chat.akash.network/api/chat/"
 
-# 静态模型列表（如果你发现 Akash 有真实 models 接口，可再做转发）
-STATIC_MODELS = [
-    {"id": "DeepSeek-V3.2", "object": "model", "created": 0, "owned_by": "akash-chat"},
-    {"id": "DeepSeek-R1", "object": "model", "created": 0, "owned_by": "akash-chat"},
-]
+# 外部调用你这个代理时使用的 API Key（OpenAI 风格）
+# 建议用环境变量：
+#   export OPENAI_PROXY_API_KEY="sk-xxxx"
+OPENAI_PROXY_API_KEY = os.environ.get("OPENAI_PROXY_API_KEY", "sk-your-secret-key-change-me")
 
-
+# Flask app
 app = Flask(__name__)
 
+# shared session for keep-alive
+_http = requests.Session()
+
 
 # =========================
-# Auth helper
+# Akash model list (static, from your JSON)
 # =========================
 
-def openai_error(message: str, status_code: int = 401, err_type: str = "invalid_request_error", code: str = "invalid_api_key"):
-    """
-    返回 OpenAI 风格错误结构
-    """
+AKASH_MODELS_RAW = [
+    {
+        "id": "DeepSeek-V3.2",
+        "model_id": "DeepSeek-V3.2",
+        "api_id": "deepseek-ai/DeepSeek-V3.2",
+        "name": "DeepSeek V3.2",
+        "description": "Advanced reasoning model with tool-calling and agentic capabilities",
+        "tier_requirement": "permissionless",
+        "available": True,
+        "temperature": "1.00",
+        "top_p": "0.95",
+        "token_limit": 64000,
+        "owned_by": None,
+        "parameters": "685B",
+        "architecture": "Mixture-of-Experts with DeepSeek Sparse Attention",
+        "hf_repo": "deepseek-ai/DeepSeek-V3.2",
+        "created_at": "2025-12-03T19:18:52.612Z",
+        "updated_at": "2025-12-05T11:22:28.877Z"
+    },
+    {
+        "id": "DeepSeek-V3.2-Speciale",
+        "model_id": "DeepSeek-V3.2-Speciale",
+        "api_id": "deepseek-ai/DeepSeek-V3.2-Speciale",
+        "name": "DeepSeek V3.2 Speciale",
+        "description": "Specialized deep reasoning model designed for complex mathematical and logical tasks",
+        "tier_requirement": "permissionless",
+        "available": True,
+        "temperature": "1.00",
+        "top_p": "0.95",
+        "token_limit": 64000,
+        "owned_by": None,
+        "parameters": "685B",
+        "architecture": "Transformer with DeepSeek Sparse Attention",
+        "hf_repo": "deepseek-ai/DeepSeek-V3.2-Speciale",
+        "created_at": "2025-12-03T13:43:01.825Z",
+        "updated_at": "2025-12-05T11:22:22.327Z"
+    },
+    {
+        "id": "Qwen/Qwen3-30B-A3B",
+        "model_id": "Qwen/Qwen3-30B-A3B",
+        "api_id": None,
+        "name": "Qwen3 30B A3B",
+        "description": "Efficient MoE model with 30.5B parameters (3.3B active)",
+        "tier_requirement": "permissionless",
+        "available": True,
+        "temperature": "0.60",
+        "top_p": "0.95",
+        "token_limit": 32768,
+        "owned_by": None,
+        "parameters": None,
+        "architecture": None,
+        "hf_repo": "Qwen/Qwen3-30B-A3B",
+        "created_at": "2025-11-24T18:08:54.575Z",
+        "updated_at": "2025-12-04T17:57:18.081Z"
+    },
+    {
+        "id": "DeepSeek-V3.1",
+        "model_id": "DeepSeek-V3.1",
+        "api_id": "deepseek-ai/DeepSeek-V3.1",
+        "name": "DeepSeek V3.1",
+        "description": "Next-generation reasoning model with enhanced capabilities",
+        "tier_requirement": "permissionless",
+        "available": True,
+        "temperature": "0.60",
+        "top_p": "0.95",
+        "token_limit": 64000,
+        "owned_by": None,
+        "parameters": "685B",
+        "architecture": "Mixture-of-Experts",
+        "hf_repo": "deepseek-ai/DeepSeek-V3.1",
+        "created_at": "2025-09-19T15:18:15.072Z",
+        "updated_at": "2025-09-19T15:18:15.072Z"
+    },
+    {
+        "id": "Meta-Llama-3-3-70B-Instruct",
+        "model_id": "Meta-Llama-3-3-70B-Instruct",
+        "api_id": "meta-llama/Llama-3.3-70B-Instruct",
+        "name": "Llama 3.3 70B",
+        "description": "Well-rounded model with strong capabilities",
+        "tier_requirement": "permissionless",
+        "available": True,
+        "temperature": "0.60",
+        "top_p": "0.90",
+        "token_limit": 128000,
+        "owned_by": None,
+        "parameters": "70B",
+        "architecture": "Transformer",
+        "hf_repo": "meta-llama/Llama-3.3-70B-Instruct",
+        "created_at": "2025-09-19T15:18:16.294Z",
+        "updated_at": "2025-09-19T15:18:16.294Z"
+    },
+    {
+        "id": "AkashGen",
+        "model_id": "AkashGen",
+        "api_id": "meta-llama/Llama-3.3-70B-Instruct",
+        "name": "AkashGen",
+        "description": "Generate images using AkashGen",
+        "tier_requirement": "permissionless",
+        "available": True,
+        "temperature": "0.85",
+        "top_p": "1.00",
+        "token_limit": 12000,
+        "owned_by": None,
+        "parameters": None,
+        "architecture": None,
+        "hf_repo": None,
+        "created_at": "2025-09-19T15:18:17.022Z",
+        "updated_at": "2025-12-05T13:24:00.355Z"
+    }
+]
+
+OPENAI_MODELS = [
+    {
+        "id": m["id"],
+        "object": "model",
+        "created": 0,
+        "owned_by": m.get("owned_by") or "akash-chat",
+    }
+    for m in AKASH_MODELS_RAW
+    if m.get("available") is True
+]
+
+SUPPORTED_MODEL_IDS = {m["id"] for m in OPENAI_MODELS}
+
+
+# =========================
+# OpenAI-style error response
+# =========================
+
+def openai_error(message: str, status_code: int = 400,
+                err_type: str = "invalid_request_error",
+                code: str = "invalid_request_error"):
     return jsonify({
         "error": {
             "message": message,
@@ -47,46 +173,49 @@ def openai_error(message: str, status_code: int = 401, err_type: str = "invalid_
     }), status_code
 
 
+# =========================
+# Bearer auth
+# =========================
+
 def require_bearer_auth():
-    """
-    校验 Authorization: Bearer <key>
-    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
-        return openai_error("Missing Authorization header. Expected: Authorization: Bearer <API_KEY>", 401)
-
+        return openai_error(
+            "Missing Authorization header. Expected: Authorization: Bearer <API_KEY>",
+            401,
+            err_type="invalid_request_error",
+            code="invalid_api_key"
+        )
     key = auth[len("Bearer "):].strip()
     if not key or key != OPENAI_PROXY_API_KEY:
-        return openai_error("Invalid API key", 401)
-
+        return openai_error(
+            "Invalid API key",
+            401,
+            err_type="invalid_request_error",
+            code="invalid_api_key"
+        )
     return None
 
 
 # =========================
-# Akash session token cache
+# Akash auth: ALWAYS refresh session_token per request
 # =========================
 
-_session = requests.Session()
-_session_token: Optional[str] = None
-_session_token_ts: float = 0.0
-
-
-def get_session_token(force_refresh: bool = False) -> str:
-    global _session_token, _session_token_ts
-
-    # 缓存 10 分钟（可以调）
-    if (not force_refresh) and _session_token and (time.time() - _session_token_ts) < 600:
-        return _session_token
-
-    res = _session.get(AKASH_SESSION_URL, timeout=30)
+def get_session_token_every_time() -> str:
+    """
+    每次请求都重新获取 session_token（你要求的）
+    """
+    res = _http.get(AKASH_SESSION_URL, timeout=30)
     res.raise_for_status()
 
-    token = res.cookies.get("session_token") or _session.cookies.get("session_token")
+    token = res.cookies.get("session_token")
     if not token:
-        raise RuntimeError("Failed to obtain session_token from Akash session endpoint")
+        # 兜底：从 session cookies 里取
+        token = _http.cookies.get("session_token")
 
-    _session_token = token
-    _session_token_ts = time.time()
+    if not token:
+        raise RuntimeError("session_token not found in Akash session response")
+
     return token
 
 
@@ -99,6 +228,7 @@ def build_akash_headers(session_token: str) -> Dict[str, str]:
         "sec-ch-ua": "\"Google Chrome\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": "\"Windows\"",
+
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
 
@@ -122,7 +252,7 @@ def openai_messages_to_akash_messages(openai_messages: List[Dict[str, Any]]) -> 
         role = m.get("role", "")
         content = m.get("content", "")
 
-        # 兼容 OpenAI 多模态 content=list
+        # OpenAI 多模态兼容：content 为 list
         if isinstance(content, list):
             text_parts = []
             for item in content:
@@ -173,6 +303,10 @@ def openai_to_akash_body(openai_req: Dict[str, Any]) -> Dict[str, Any]:
 # =========================
 
 def extract_assistant_text_from_akash(akash_resp: Any) -> str:
+    """
+    尽可能抽取 assistant 输出
+    你后续贴 Akash /api/chat 的真实返回结构，我可以把它改成完全精准。
+    """
     if isinstance(akash_resp, str):
         return akash_resp
     if not isinstance(akash_resp, dict):
@@ -227,38 +361,46 @@ def make_openai_chat_completion_response(model: str, assistant_text: str, raw_up
 
 @app.get("/v1/models")
 def v1_models():
-    # 鉴权
     auth_err = require_bearer_auth()
     if auth_err:
         return auth_err
-    return jsonify({"object": "list", "data": STATIC_MODELS})
+
+    return jsonify({"object": "list", "data": OPENAI_MODELS})
 
 
 @app.post("/v1/chat/completions")
 def v1_chat_completions():
-    # 鉴权
     auth_err = require_bearer_auth()
     if auth_err:
         return auth_err
 
     openai_req = request.get_json(force=True, silent=False)
 
-    # 先不实现 stream（你要我也可以加 SSE stream）
+    # 模型校验（避免用户传错）
+    model = openai_req.get("model", "")
+    if model and model not in SUPPORTED_MODEL_IDS:
+        return openai_error(
+            f"Model '{model}' not found. Supported models: {sorted(SUPPORTED_MODEL_IDS)}",
+            400,
+            err_type="invalid_request_error",
+            code="model_not_found"
+        )
+
     if openai_req.get("stream"):
-        return openai_error("stream is not supported yet (Flask minimal version)", 400, code="unsupported")
+        return openai_error(
+            "stream is not supported in this version (Flask minimal). If you want, I can add SSE streaming.",
+            400,
+            err_type="invalid_request_error",
+            code="unsupported"
+        )
 
     try:
-        token = get_session_token()
+        # 每次请求都刷新 session_token（你要求）
+        token = get_session_token_every_time()
         headers = build_akash_headers(token)
         akash_body = openai_to_akash_body(openai_req)
 
-        upstream = _session.post(AKASH_CHAT_URL, headers=headers, json=akash_body, timeout=120)
-
-        if upstream.status_code in (401, 403):
-            token = get_session_token(force_refresh=True)
-            headers = build_akash_headers(token)
-            upstream = _session.post(AKASH_CHAT_URL, headers=headers, json=akash_body, timeout=120)
-
+        upstream = _http.post(AKASH_CHAT_URL, headers=headers, json=akash_body, timeout=120)
         upstream.raise_for_status()
 
         try:
@@ -267,19 +409,30 @@ def v1_chat_completions():
             akash_resp = upstream.text
 
         assistant_text = extract_assistant_text_from_akash(akash_resp)
-        model = openai_req.get("model", "DeepSeek-V3.2")
-
-        return jsonify(make_openai_chat_completion_response(model, assistant_text, akash_resp))
+        return jsonify(make_openai_chat_completion_response(model or "DeepSeek-V3.2", assistant_text, akash_resp))
 
     except requests.HTTPError as e:
-        return openai_error(f"Akash upstream HTTP error: {str(e)}", 502, err_type="server_error", code="upstream_error")
+        # 返回 OpenAI 风格的上游错误
+        return openai_error(
+            f"Akash upstream HTTP error: {str(e)}",
+            502,
+            err_type="server_error",
+            code="upstream_error"
+        )
     except Exception as e:
-        return openai_error(str(e), 500, err_type="server_error", code="internal_error")
+        return openai_error(
+            str(e),
+            500,
+            err_type="server_error",
+            code="internal_error"
+        )
 
 
 @app.post("/v1/completions")
 def v1_completions():
-    # 鉴权
+    """
+    旧版 completions：把 prompt 转成 chat/completions
+    """
     auth_err = require_bearer_auth()
     if auth_err:
         return auth_err
@@ -291,10 +444,17 @@ def v1_completions():
     temperature = req_json.get("temperature", 1.0)
     top_p = req_json.get("top_p", 0.95)
 
+    if model and model not in SUPPORTED_MODEL_IDS:
+        return openai_error(
+            f"Model '{model}' not found. Supported models: {sorted(SUPPORTED_MODEL_IDS)}",
+            400,
+            err_type="invalid_request_error",
+            code="model_not_found"
+        )
+
     if isinstance(prompt, list):
         prompt = "\n".join([str(x) for x in prompt])
 
-    # completions -> chat/completions
     openai_chat_req = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -302,19 +462,12 @@ def v1_completions():
         "top_p": top_p,
     }
 
-    # 复用 chat/completions 逻辑
     try:
-        token = get_session_token()
+        token = get_session_token_every_time()
         headers = build_akash_headers(token)
         akash_body = openai_to_akash_body(openai_chat_req)
 
-        upstream = _session.post(AKASH_CHAT_URL, headers=headers, json=akash_body, timeout=120)
-
-        if upstream.status_code in (401, 403):
-            token = get_session_token(force_refresh=True)
-            headers = build_akash_headers(token)
-            upstream = _session.post(AKASH_CHAT_URL, headers=headers, json=akash_body, timeout=120)
-
+        upstream = _http.post(AKASH_CHAT_URL, headers=headers, json=akash_body, timeout=120)
         upstream.raise_for_status()
 
         try:
@@ -341,9 +494,19 @@ def v1_completions():
         })
 
     except requests.HTTPError as e:
-        return openai_error(f"Akash upstream HTTP error: {str(e)}", 502, err_type="server_error", code="upstream_error")
+        return openai_error(
+            f"Akash upstream HTTP error: {str(e)}",
+            502,
+            err_type="server_error",
+            code="upstream_error"
+        )
     except Exception as e:
-        return openai_error(str(e), 500, err_type="server_error", code="internal_error")
+        return openai_error(
+            str(e),
+            500,
+            err_type="server_error",
+            code="internal_error"
+        )
 
 
 # =========================
@@ -351,5 +514,5 @@ def v1_completions():
 # =========================
 
 if __name__ == "__main__":
-    # debug=True 仅本地调试用，上线建议关掉
+    # debug=True 仅用于本地调试，上线建议关闭
     app.run(host="0.0.0.0", port=10006, debug=True)
