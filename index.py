@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify
 
 # 你自己的 OpenAI 风格 API Key（外部客户端调用你代理时用）
 # 建议用环境变量：export OPENAI_PROXY_API_KEY="sk-xxx"
-OPENAI_PROXY_API_KEY = os.environ.get("OPENAI_PROXY_API_KEY", "sk-your-secret-key-change-me")
+OPENAI_PROXY_API_KEY = 'default-key'
 
 AKASH_SESSION_URL = "https://chat.akash.network/api/auth/session/"
 AKASH_CHAT_URL = "https://chat.akash.network/api/chat/"
