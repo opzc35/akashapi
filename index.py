@@ -18,7 +18,7 @@ AKASH_CHAT_URL = "https://chat.akash.network/api/chat/"
 # 外部调用你这个代理时使用的 API Key（OpenAI 风格）
 # 建议用环境变量：
 #   export OPENAI_PROXY_API_KEY="sk-xxxx"
-OPENAI_PROXY_API_KEY = os.environ.get("OPENAI_PROXY_API_KEY", "sk-your-secret-key-change-me")
+OPENAI_PROXY_API_KEY = 'default-key'
 
 # Flask app
 app = Flask(__name__)
