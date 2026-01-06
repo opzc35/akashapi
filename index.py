@@ -2,7 +2,7 @@ import os
 import time
 import uuid
 import json
-from typing import Any, Dict, List, Optional, Generator, Tuple
+from typing import Any, Dict, List, Generator, Tuple
 
 import requests
 from flask import Flask, request, jsonify, Response
@@ -14,16 +14,34 @@ from flask import Flask, request, jsonify, Response
 
 AKASH_SESSION_URL = "https://chat.akash.network/api/auth/session/"
 AKASH_CHAT_URL = "https://chat.akash.network/api/chat/"
-OPENAI_PROXY_API_KEY = 'default-key'
 
+# 外部调用你的代理时使用的 Bearer Key
+OPENAI_PROXY_API_KEY = 'default_key'
+
+# SOCKS 代理：通过环境变量配置
+# 示例：
+#   export SOCKS_PROXY="socks5h://127.0.0.1:7890"
+# 或带账号密码：
+#   export SOCKS_PROXY="socks5h://user:pass@127.0.0.1:7890"
+SOCKS_PROXY = os.environ.get("SOCKS_PROXY", "").strip()
+
+# Flask
 app = Flask(__name__)
+
+# requests Session（keep-alive）
 _http = requests.Session()
+
+# 如果配置了 SOCKS 代理，就启用
+if SOCKS_PROXY:
+    _http.proxies.update({
+        "http": SOCKS_PROXY,
+        "https": SOCKS_PROXY,
+    })
 
 
 # =========================
 # Models (static)
 # =========================
-
 OPENAI_MODELS = [
     {"id": "DeepSeek-V3.2", "object": "model", "created": 0, "owned_by": "akash-chat"},
     {"id": "DeepSeek-V3.2-Speciale", "object": "model", "created": 0, "owned_by": "akash-chat"},
@@ -100,6 +118,10 @@ def pick_float(req: Dict[str, Any], key: str, default: float) -> float:
 # =========================
 
 def get_session_token_every_time() -> str:
+    """
+    每次请求都获取新的 session_token。
+    注意：这个请求也会走 SOCKS_PROXY（如果你设置了）。
+    """
     res = _http.get(AKASH_SESSION_URL, timeout=30)
     res.raise_for_status()
     token = res.cookies.get("session_token") or _http.cookies.get("session_token")
@@ -139,7 +161,7 @@ def openai_messages_to_akash_messages(openai_messages: List[Dict[str, Any]]) -> 
         role = m.get("role", "")
         content = m.get("content", "")
 
-        # OpenAI 多模态兼容
+        # OpenAI 多模态兼容：content=list
         if isinstance(content, list):
             text_parts = []
             for item in content:
@@ -184,17 +206,9 @@ def openai_to_akash_body(openai_req: Dict[str, Any]) -> Dict[str, Any]:
 
 # =========================
 # Akash stream parser
-# Upstream frames:
-#   f: {...}  (start)
-#   0: "你"   (token)
-#   d: {...}  (done)
 # =========================
 
 def parse_akash_line(line: str) -> Tuple[str, Any]:
-    """
-    Return (kind, payload)
-    kind in {"start","token","done","unknown"}
-    """
     line = line.strip()
     if not line:
         return ("unknown", None)
@@ -208,14 +222,12 @@ def parse_akash_line(line: str) -> Tuple[str, Any]:
 
     if line.startswith("0:"):
         raw = line[2:].strip()
-        # token 通常是 JSON string: "你"
         try:
             tok = json.loads(raw)
             if isinstance(tok, str):
                 return ("token", tok)
             return ("token", str(tok))
         except Exception:
-            # 兜底：去掉可能的引号
             return ("token", raw.strip("\""))
 
     if line.startswith("d:"):
@@ -232,7 +244,7 @@ def sse_event(obj: Any) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def openai_chunk(chunk_id: str, model: str, delta: Dict[str, Any], finish_reason: Optional[str] = None,
+def openai_chunk(chunk_id: str, model: str, delta: Dict[str, Any], finish_reason: Any = None,
                  created: Optional[int] = None) -> Dict[str, Any]:
     return {
         "id": chunk_id,
@@ -248,18 +260,12 @@ def openai_chunk(chunk_id: str, model: str, delta: Dict[str, Any], finish_reason
 
 
 def akash_stream_to_openai_sse(upstream: requests.Response, model: str) -> Generator[str, None, None]:
-    """
-    实时读取 Akash 上游 stream，并转换成 OpenAI SSE chunks
-    """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
-    # 先发 role chunk（兼容多数客户端）
+    # role chunk
     yield sse_event(openai_chunk(chunk_id, model, {"role": "assistant"}, None, created))
 
-    full_text_parts: List[str] = []
-
-    # 逐行读取（Akash 这种是按行分帧）
     for raw in upstream.iter_lines(decode_unicode=True):
         if raw is None:
             continue
@@ -270,46 +276,16 @@ def akash_stream_to_openai_sse(upstream: requests.Response, model: str) -> Gener
         kind, payload = parse_akash_line(line)
 
         if kind == "token":
-            full_text_parts.append(payload)
             yield sse_event(openai_chunk(chunk_id, model, {"content": payload}, None, created))
 
         elif kind == "done":
-            # 结束 chunk
             yield sse_event(openai_chunk(chunk_id, model, {}, "stop", created))
             yield "data: [DONE]\n\n"
             return
 
-        else:
-            # 忽略未知帧，或者你也可以 print(line) 调试
-            continue
-
-    # 如果上游断开但没有 d:，也要结束
+    # upstream ended unexpectedly
     yield sse_event(openai_chunk(chunk_id, model, {}, "stop", created))
     yield "data: [DONE]\n\n"
-
-
-def akash_stream_collect_text(upstream: requests.Response) -> Tuple[str, Any]:
-    """
-    如果客户端没有 stream=true，我们仍然可能从 Akash 收到流式响应，
-    这里把 token 收集成完整文本，并返回最后的 done payload（如果有）。
-    """
-    parts: List[str] = []
-    done_payload: Any = None
-
-    for raw in upstream.iter_lines(decode_unicode=True):
-        if raw is None:
-            continue
-        line = raw.strip()
-        if not line:
-            continue
-
-        kind, payload = parse_akash_line(line)
-        if kind == "token":
-            parts.append(payload)
-        elif kind == "done":
-            done_payload = payload
-
-    return ("".join(parts), done_payload)
 
 
 # =========================
@@ -350,11 +326,15 @@ def v1_chat_completions():
         headers = build_akash_headers(token)
         akash_body = openai_to_akash_body(openai_req)
 
-        # 关键：stream=True 让 requests 不要一次性读完
-        upstream = _http.post(AKASH_CHAT_URL, headers=headers, json=akash_body, stream=True, timeout=120)
+        upstream = _http.post(
+            AKASH_CHAT_URL,
+            headers=headers,
+            json=akash_body,
+            stream=True,          # 关键：上游流式
+            timeout=120
+        )
         upstream.raise_for_status()
 
-        # 如果客户端要 stream：实时转发 SSE
         if want_stream:
             gen = akash_stream_to_openai_sse(upstream, model)
             return Response(
@@ -366,23 +346,31 @@ def v1_chat_completions():
                 }
             )
 
-        # 否则：收集 token，合并为一个完整文本，再按 OpenAI 非流式返回
-        full_text, done_payload = akash_stream_collect_text(upstream)
+        # 如果客户端不想 stream，就收集拼接（这里简单处理：读取完再返回）
+        # 你也可以后续加更好的 usage 统计对齐
+        parts = []
+        for raw in upstream.iter_lines(decode_unicode=True):
+            if raw is None:
+                continue
+            line = raw.strip()
+            if not line:
+                continue
+            kind, payload = parse_akash_line(line)
+            if kind == "token":
+                parts.append(payload)
+            elif kind == "done":
+                break
 
+        full_text = "".join(parts)
         resp = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model,
             "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": full_text},
-                    "finish_reason": "stop",
-                }
+                {"index": 0, "message": {"role": "assistant", "content": full_text}, "finish_reason": "stop"}
             ],
-            "usage": None,
-            "akash_done": done_payload
+            "usage": None
         }
         return jsonify(resp)
 
@@ -407,4 +395,5 @@ def v1_chat_completions():
 # =========================
 
 if __name__ == "__main__":
+    # 生产建议 debug=False
     app.run(host="0.0.0.0", port=10006, debug=True, threaded=True)
